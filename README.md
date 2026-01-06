@@ -1,5 +1,7 @@
 # Kausality
 
+> **⚠️ EXPERIMENTAL: This is a design experiment. Nothing is implemented yet. The ideas here may be flawed, incomplete, or entirely impractical.**
+
 **Every mutation needs a cause.**
 
 Kausality traces and gates spec changes through Kubernetes object hierarchies. Controllers cannot mutate downstream resources unless explicitly allowed.
@@ -27,6 +29,3 @@ Without an allowance, controllers cannot mutate downstream resources.
 
 See [doc/DESIGN.md](doc/DESIGN.md) for the full design.
 
-## Status
-
-Early design phase. Not yet implemented.
