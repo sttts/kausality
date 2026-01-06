@@ -246,6 +246,117 @@ Controller mutates ReplicaSet
 - User identity comes from Kubernetes authentication (not self-declared)
 - Default-deny: without a matching allowance, controllers cannot mutate downstream
 
+## Creation vs Steady State
+
+On initial creation, the entire object graph needs to be built. Every child is "new", not a "mutation". We need broader permissions during initialization.
+
+**Implicit creation allowance**: If the parent object has never been reconciled (`status.observedGeneration` is unset or zero), child creation is implicitly allowed. Once the parent reaches steady state (has been successfully reconciled at least once), explicit allowances are required for changes.
+
+This means:
+- First reconciliation of a new Deployment → may freely create ReplicaSets
+- Subsequent changes to the Deployment → require explicit allowances
+
+The signal for "ready at least once" could be:
+- `status.observedGeneration >= 1`
+- A condition like `Ready=True` having been observed
+- A dedicated annotation `kausality.io/initialized: "true"` set by the Kausality controller
+
+## Controller and API Upgrades
+
+When controllers or APIs are upgraded, reconciliation may need to touch all objects (new defaults, schema migrations, etc.). This requires a mechanism to grant temporary broad allowances.
+
+### UpgradeAllowance
+
+```yaml
+kind: UpgradeAllowance
+apiVersion: kausality.io/v1alpha1
+metadata:
+  name: deployment-controller-v1.2.3
+spec:
+  serviceAccount: system:serviceaccount:kube-system:deployment-controller
+  validUntil: "2024-01-10T00:00:00Z"  # safety net
+```
+
+When admission processes a mutation:
+1. Finds UpgradeAllowance(s) for the requesting ServiceAccount
+2. Checks object annotation: `kausality.io/last-upgrade`
+3. If annotation missing or references older UpgradeAllowance → grants broad allowance, sets annotation
+4. If annotation matches current UpgradeAllowance → normal rules apply (already upgraded)
+
+```yaml
+# On object after upgrade
+metadata:
+  annotations:
+    kausality.io/last-upgrade: "deployment-controller-v1.2.3"
+```
+
+Each object gets upgraded exactly once per UpgradeAllowance. The annotation tracks which upgrade has been applied.
+
+### Open Question: Activation Timing
+
+**Problem**: The UpgradeAllowance must become active only when the new controller is actually running. Otherwise:
+- If activated before deployment: old controller might consume the upgrade allowance
+- If activated after deployment: new controller is blocked until activation
+
+Both old and new controller use the same ServiceAccount, so admission cannot distinguish them.
+
+**Options considered:**
+
+**A. Explicit activation**
+```yaml
+spec:
+  active: false  # flip manually after deployment verified
+```
+- Pro: Simple, explicit
+- Con: Window where new controller is blocked waiting for activation
+
+**B. Time window**
+```yaml
+spec:
+  validFrom: "2024-01-06T15:05:00Z"
+  validUntil: "2024-01-10T00:00:00Z"
+```
+- Pro: Can be created ahead of time
+- Con: Requires estimating deployment time; old controller might be running at validFrom
+
+**C. Reference controller Deployment generation**
+```yaml
+spec:
+  controllerRef:
+    kind: Deployment
+    name: deployment-controller
+    namespace: kube-system
+    minGeneration: 15
+```
+- Pro: Tied to actual deployment
+- Con: Deployment generation doesn't indicate pods are actually running
+
+**D. Pod-based activation**
+```yaml
+spec:
+  activateWhen:
+    podSelector:
+      namespace: kube-system
+      labels:
+        app: deployment-controller
+    image: "registry.io/deployment-controller:v1.2.3"
+status:
+  active: false  # set by Kausality controller when pod is Ready
+```
+- Pro: Activates exactly when new pod is ready
+- Con: Brief overlap during rollout where both old and new pods run; complexity
+
+**E. Different ServiceAccount per version**
+- Pro: Clean separation
+- Con: Operationally complex, requires SA rotation on every upgrade
+
+**No perfect solution exists.** The fundamental problem is that admission cannot distinguish which version of a controller is making a request when they share a ServiceAccount.
+
+Possible mitigations for the overlap window:
+- Accept that old controller might reconcile during brief overlap (changes should be idempotent)
+- Use rollout strategies that minimize overlap (Recreate instead of RollingUpdate)
+- Controller-specific ServiceAccounts (option E) for critical controllers
+
 ## Crossplane Integration
 
 Crossplane manages external resources (cloud infrastructure) through a hierarchy:
