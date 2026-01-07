@@ -114,7 +114,7 @@ spec:
     capture:                                         # fields to store in trace
     - "metadata.annotations[jira]"
     - "metadata.annotations[approved-by]"
-    allow:
+    policies:
     - ...
 ```
 
@@ -153,27 +153,34 @@ spec:
     name: deployment-controller
     namespace: kube-system
 
-  # What's allowed during initialization
+  # Policies during initialization (omit or empty = unrestricted)
   initializing:
     when: "!has(object.status.observedGeneration)"
-    allow:
-    - relation: ControllerChild
+    policies:
+    - target:
+        apiGroup: apps
+        apiVersion: v1
+        resource: replicasets
+      relation: ControllerChild
       verbs: [Create]
       mutations:
       - jsonPath: "*"
         verbs: [Insert, Mutate]
 
-  # What's allowed during deletion
-  # Default when omitted: ControllerChild verbs: ["*"], NO External
+  # Policies during deletion (omit or empty = unrestricted)
   deleting:
-    allow:
-    - relation: ControllerChild
+    policies:
+    - target:
+        apiGroup: apps
+        apiVersion: v1
+        resource: replicasets
+      relation: ControllerChild
       verbs: ["*"]
 
-  # Steady-state rules (trigger → allow mappings)
+  # Steady-state rules (trigger → policies mappings)
   rules:
   - trigger: "spec.replicas"
-    allow:
+    policies:
     - target:
         apiGroup: apps
         apiVersion: v1
@@ -191,7 +198,7 @@ spec:
     capture:
     - "metadata.annotations[jira]"
     - "metadata.annotations[approved-by]"
-    allow:
+    policies:
     - target:
         apiGroup: apps
         apiVersion: v1
@@ -201,12 +208,70 @@ spec:
       mutations:
       - jsonPath: "spec.template.spec.containers[*]"
         verbs: [Insert, Delete, Mutate]
-    - relation: External
-      externalTarget:
-        provider: aws
-        service: rds
+    - target:
+        external:
+          provider: aws
+          service: rds
+      relation: External
       verbs: [Update, Delete, Create]
 ```
+
+### Simplified Example
+
+A schema-less policy that bounds children on any spec change, without enumerating field-level mutations:
+
+```yaml
+kind: AllowancePolicy
+apiVersion: kausality.io/v1alpha1
+metadata:
+  name: deployment-policy-simple
+spec:
+  for:
+    apiGroup: apps
+    apiVersion: v1
+    kind: Deployment
+
+  subjects:
+  - kind: ServiceAccount
+    name: deployment-controller
+    namespace: kube-system
+    mayInitiate: true
+
+  initializing:
+    policies:
+    - target:
+        apiGroup: apps
+        apiVersion: v1
+        resource: replicasets
+      relation: ControllerChild
+      verbs: [Create]
+
+  deleting:
+    policies:
+    - target:
+        apiGroup: apps
+        apiVersion: v1
+        resource: replicasets
+      relation: ControllerChild
+      verbs: ["*"]
+
+  rules:
+  - trigger: "spec"
+    policies:
+    - target:
+        apiGroup: apps
+        apiVersion: v1
+        resource: replicasets
+      relation: ControllerChild
+      verbs: ["*"]
+```
+
+This says:
+- **`trigger: "spec"`** — any change under `spec` triggers the rule
+- **`verbs: ["*"]`** — Create, Update, Delete all permitted for replicasets
+- **No `mutations`** — all field mutations allowed when `verbs` includes `Update`
+
+The effect: replicasets are bounded (tracked) but can be freely mutated when the parent spec changes. Other child types (not mentioned) are unrestricted.
 
 ### for
 
@@ -233,53 +298,37 @@ Subjects without `mayInitiate` can only propagate allowances that already exist 
 
 ### initializing
 
-What's allowed during initialization (before first successful reconcile).
+Upper bounds during initialization (before first successful reconcile).
 
 | Field | Description |
 |-------|-------------|
 | `when` | CEL expression, true = still initializing. Default: `"!has(object.status.observedGeneration)"` |
-| `allow` | List of permitted operations during initialization |
+| `policies` | List of policy entries bounding operations during initialization |
 
-Typical use: allow `Create` and late initialization mutations, but not `Delete`.
+If `policies` is omitted or empty, initialization is unrestricted.
 
 ### deleting
 
-What's allowed when parent has `deletionTimestamp`.
+Upper bounds when parent has `deletionTimestamp`.
 
 | Field | Description |
 |-------|-------------|
-| `allow` | List of permitted operations during deletion |
+| `policies` | List of policy entries bounding operations during deletion |
 
-**Defaults when `deleting` is omitted:**
-- `ControllerChild`: `verbs: ["*"]` (all child KRM objects can be deleted)
-- `External`: NOT allowed (external resources preserved by default)
-
-To delete external resources, add explicitly:
-```yaml
-deleting:
-  allow:
-  - relation: ControllerChild
-    verbs: ["*"]
-  - relation: External
-    verbs: [Delete]
-```
-
-To orphan all children:
-```yaml
-deleting:
-  allow: []
-```
+If `policies` is omitted or empty, deletion is unrestricted.
 
 ### rules
 
-List of trigger → allow mappings for steady state. Each rule defines what downstream operations are permitted when a specific field changes.
+List of trigger → policies mappings for steady state. Each rule defines upper bounds for downstream operations when a specific field changes.
 
 | Field | Description |
 |-------|-------------|
 | `trigger` | JSON path of the field that triggers this rule (supports `[*]` wildcards) |
 | `conditions` | CEL expressions that must all pass (optional) |
 | `capture` | Fields to capture in the trace as attestations (optional) |
-| `allow` | List of permitted downstream operations |
+| `policies` | List of policy entries bounding downstream operations |
+
+If `policies` is omitted or empty for a rule, that trigger allows unrestricted downstream operations.
 
 CEL expressions have access to `object` and `oldObject`. Use cases:
 - Require external references: `has(object.metadata.annotations['jira'])`
@@ -289,21 +338,24 @@ CEL expressions have access to `object` and `oldObject`. Use cases:
 
 Wildcards in trigger paths (e.g., `[*]`) match any index; traces record the actual index.
 
-### allow
+### policies
 
-Each entry in `allow` specifies permitted operations:
+Each entry in `policies` defines an upper bound for a specific target GVR:
 
 | Field | Description |
 |-------|-------------|
-| `target` | Target object GVR — must be complete or omitted entirely |
+| `target` | Target (required) — GVR for `ControllerChild`, or `external` map for `External` |
 | `relation` | `ControllerChild` or `External` |
-| `verbs` | Object-level operations |
-| `mutations` | Field-level operations (only for `ControllerChild`) |
-| `externalTarget` | Provider-specific target identifier (only for `External`) |
+| `verbs` | Object-level operations allowed |
+| `mutations` | Field-level operations allowed (only for `ControllerChild`) |
 
-**Target specificity rule:** Either specify a complete GVR, or omit `target` and use `verbs: ["*"]`. Partial targets are not allowed.
+**Upper-bound semantics:**
+- For each GVR, collect all policy entries that match it
+- The union of those entries is the upper bound for that GVR
+- GVRs not mentioned in any policy entry are **unrestricted**
+- `policies: []` (empty) means nothing is restricted → everything unrestricted
 
-The `target` uses `resource` (plural, lowercase) because it describes admission on API resources:
+**`target` is required.** Without a target, a policy entry doesn't restrict anything. The `target` uses `resource` (plural, lowercase) because it describes admission on API resources:
 
 | Field | Description |
 |-------|-------------|
@@ -338,19 +390,21 @@ Only for `relation: ControllerChild`. Specifies which fields may be mutated when
 
 If `mutations` is omitted and `verbs` includes `Update`, all field mutations are allowed.
 
-### externalTarget
+### target.external
 
 Only for `relation: External`. Free-form `map[string]string` to identify the external resource type. Provider-specific, Kausality doesn't interpret it.
 
 ```yaml
 # Crossplane
-externalTarget:
-  provider: provider-aws
-  kind: RDSInstance
+target:
+  external:
+    provider: provider-aws
+    kind: RDSInstance
 
 # Terraform
-externalTarget:
-  resource: aws_rds_cluster
+target:
+  external:
+    resource: aws_rds_cluster
 ```
 
 ## Admission Flow
@@ -410,7 +464,7 @@ Typical permissions:
 
 ### Steady State
 
-After initialization completes (CEL expression becomes false), explicit allowances are required for all changes. The `rules` section defines trigger → allow mappings.
+After initialization completes (CEL expression becomes false), explicit allowances are required for all changes. The `rules` section defines trigger → policies mappings.
 
 ### Deleting
 
@@ -460,12 +514,18 @@ metadata:
   name: crossplane-upgrade
 spec:
   serviceAccount: system:serviceaccount:crossplane-system:crossplane
-  allow:
-  - kind: RDSInstance
+  policies:
+  - target:
+      apiGroup: rds.aws.crossplane.io
+      apiVersion: v1alpha1
+      resource: rdsinstances
     relation: ControllerChild
     mutations: ["spec.forProvider"]
-  - relation: External
-    mutations: ["Update"]
+  - target:
+      external:
+        provider: provider-aws
+    relation: External
+    verbs: [Update]
 ```
 
 No `validFrom`/`validUntil` needed — activation is automatic based on user-agent change.
@@ -474,7 +534,7 @@ No `validFrom`/`validUntil` needed — activation is automatic based on user-age
 1. Controller (new version) mutates object
 2. Admission sees user-agent hash differs from annotation
 3. Finds UpgradeAllowance for this ServiceAccount
-4. Checks if mutation matches an entry in `allow`
+4. Checks if mutation matches an entry in `policies`
 5. If match: grant allowance, update `kausality.io/controller-ua-hash`
 6. If no match or no UpgradeAllowance: block or escalate
 
@@ -534,21 +594,30 @@ Each level connected by ownerRefs. Kausality traces and gates mutations through 
 For non-KRM resources, use `relation: External`:
 
 ```yaml
-allow:
+policies:
 # KRM mutations (what the controller may change on child MRs)
-- kind: RDSInstance
+- target:
+    apiGroup: rds.aws.crossplane.io
+    apiVersion: v1alpha1
+    resource: rdsinstances
   relation: ControllerChild
-  mutations: ["spec.forProvider.instanceClass"]
+  mutations:
+  - jsonPath: "spec.forProvider.instanceClass"
+    verbs: [Mutate]
 
 # External mutations (what the provider may do to cloud resources)
-- relation: External
-  mutations: ["Update"]
+- target:
+    external:
+      provider: provider-aws
+      kind: RDSInstance
+  relation: External
+  verbs: [Update]
 ```
 
-The `mutations` vocabulary for External is system-specific:
+The `verbs` vocabulary for External is system-specific:
 
-| System | Mutations |
-|--------|-----------|
+| System | Verbs |
+|--------|-------|
 | Crossplane | `Create`, `Update`, `Delete` (managementPolicies verbs) |
 | Terraform | `apply`, `destroy` |
 | ArgoCD | `sync`, `delete` |
@@ -691,20 +760,29 @@ spec:
 
   initializing:
     when: "!has(object.status.observedGeneration)"
-    allow:
-    - relation: ControllerChild
+    policies:
+    - target:
+        apiGroup: example.com
+        apiVersion: v1alpha1
+        resource: xdatabases
+      relation: ControllerChild
       verbs: [Create]
       mutations:
       - jsonPath: "*"
         verbs: [Insert, Mutate]
 
   deleting:
-    allow:
-    - relation: ControllerChild
+    policies:
+    - target:
+        apiGroup: example.com
+        apiVersion: v1alpha1
+        resource: xdatabases
+      relation: ControllerChild
       verbs: ["*"]
-    - relation: External
-      externalTarget:
-        provider: provider-aws
+    - target:
+        external:
+          provider: provider-aws
+      relation: External
       verbs: [Delete]
 
   rules:
@@ -713,7 +791,7 @@ spec:
     - "has(object.metadata.annotations['jira'])"
     capture:
     - "metadata.annotations[jira]"
-    allow:
+    policies:
     - target:
         apiGroup: example.com
         apiVersion: v1alpha1
@@ -729,7 +807,7 @@ spec:
     - "has(object.metadata.annotations['jira'])"
     capture:
     - "metadata.annotations[jira]"
-    allow:
+    policies:
     - target:
         apiGroup: example.com
         apiVersion: v1alpha1
@@ -757,29 +835,39 @@ spec:
 
   initializing:
     when: "!has(object.status.observedGeneration)"
-    allow:
-    - relation: ControllerChild
+    policies:
+    - target:
+        apiGroup: rds.aws.crossplane.io
+        apiVersion: v1alpha1
+        resource: rdsinstances
+      relation: ControllerChild
       verbs: [Create]
       mutations:
       - jsonPath: "*"
         verbs: [Insert, Mutate]
-    - relation: External
-      externalTarget:
-        provider: provider-aws
+    - target:
+        external:
+          provider: provider-aws
+      relation: External
       verbs: [Create]
 
   deleting:
-    allow:
-    - relation: ControllerChild
+    policies:
+    - target:
+        apiGroup: rds.aws.crossplane.io
+        apiVersion: v1alpha1
+        resource: rdsinstances
+      relation: ControllerChild
       verbs: ["*"]
-    - relation: External
-      externalTarget:
-        provider: provider-aws
+    - target:
+        external:
+          provider: provider-aws
+      relation: External
       verbs: [Delete]
 
   rules:
   - trigger: "spec.size"
-    allow:
+    policies:
     - target:
         apiGroup: rds.aws.crossplane.io
         apiVersion: v1alpha1
@@ -789,16 +877,17 @@ spec:
       mutations:
       - jsonPath: "spec.forProvider.instanceClass"
         verbs: [Mutate]
-    - relation: External
-      externalTarget:
-        provider: provider-aws
-        kind: RDSInstance
+    - target:
+        external:
+          provider: provider-aws
+          kind: RDSInstance
+      relation: External
       verbs: [Update]
 
   - trigger: "spec.engine"
     conditions:
     - "object.metadata.annotations['allow-recreate'] == 'true'"
-    allow:
+    policies:
     - target:
         apiGroup: rds.aws.crossplane.io
         apiVersion: v1alpha1
@@ -808,10 +897,11 @@ spec:
       mutations:
       - jsonPath: "spec.forProvider.engine"
         verbs: [Mutate]
-    - relation: External
-      externalTarget:
-        provider: provider-aws
-        kind: RDSInstance
+    - target:
+        external:
+          provider: provider-aws
+          kind: RDSInstance
+      relation: External
       verbs: [Delete, Create]  # destructive: recreate
 ```
 
@@ -894,8 +984,21 @@ spec:
 
   initializing:
     when: "!has(object.status.observedGeneration)"
-    allow:
-    - relation: ControllerChild
+    policies:
+    - target:
+        apiGroup: apps
+        apiVersion: v1
+        resource: deployments
+      relation: ControllerChild
+      verbs: [Create]
+      mutations:
+      - jsonPath: "*"
+        verbs: [Insert, Mutate]
+    - target:
+        apiGroup: ""
+        apiVersion: v1
+        resource: services
+      relation: ControllerChild
       verbs: [Create]
       mutations:
       - jsonPath: "*"
@@ -903,7 +1006,7 @@ spec:
 
   rules:
   - trigger: "spec.name"
-    allow:
+    policies:
     - target:
         apiGroup: apps
         apiVersion: v1
@@ -924,7 +1027,7 @@ spec:
         verbs: [Mutate]
 
   - trigger: "spec.replicas"
-    allow:
+    policies:
     - target:
         apiGroup: apps
         apiVersion: v1
@@ -936,7 +1039,7 @@ spec:
         verbs: [Mutate]
 
   - trigger: "spec.image"
-    allow:
+    policies:
     - target:
         apiGroup: apps
         apiVersion: v1
@@ -954,10 +1057,10 @@ spec:
 2. For each `${schema.spec.X}` reference in a resource template:
    - Extract the schema field path (`spec.X`)
    - Extract the target resource and field path
-   - Create a rule: `trigger: spec.X` → `allow: [{target, jsonPath}]`
+   - Create a rule: `trigger: spec.X` → `policies: [{target, jsonPath}]`
 3. For inter-resource references (`${resourceId.field}`):
    - Track transitive dependencies
-   - Include in parent's allow list
+   - Include in parent's policies list
 4. Set `subjects` to the Kro controller ServiceAccount
 5. Annotate with source RGD for traceability
 
