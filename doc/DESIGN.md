@@ -140,7 +140,7 @@ apiVersion: kausality.io/v1alpha1
 metadata:
   name: deployment-policy
 spec:
-  target:
+  for:
     apiGroup: apps
     apiVersion: v1
     kind: Deployment
@@ -177,7 +177,7 @@ spec:
     - target:
         apiGroup: apps
         apiVersion: v1
-        kind: ReplicaSet
+        resource: replicasets
       relation: ControllerChild
       verbs: [Update, Delete]
       mutations:
@@ -195,7 +195,7 @@ spec:
     - target:
         apiGroup: apps
         apiVersion: v1
-        kind: ReplicaSet
+        resource: replicasets
       relation: ControllerChild
       verbs: [Update]
       mutations:
@@ -208,7 +208,7 @@ spec:
       verbs: [Update, Delete, Create]
 ```
 
-### target
+### for
 
 The object kind this policy applies to, fully qualified:
 
@@ -216,7 +216,7 @@ The object kind this policy applies to, fully qualified:
 |-------|-------------|
 | `apiGroup` | API group (e.g., `apps`, `crossplane.io`) |
 | `apiVersion` | API version (e.g., `v1`, `v1alpha1`) |
-| `kind` | Object kind |
+| `kind` | Object kind (singular, CamelCase, e.g., `Deployment`, `ReplicaSet`) |
 
 ### subjects
 
@@ -295,11 +295,21 @@ Each entry in `allow` specifies permitted operations:
 
 | Field | Description |
 |-------|-------------|
-| `target` | Target object GVK (optional — omit to allow any kind for this relation) |
+| `target` | Target object GVR — must be complete or omitted entirely |
 | `relation` | `ControllerChild` or `External` |
 | `verbs` | Object-level operations |
 | `mutations` | Field-level operations (only for `ControllerChild`) |
 | `externalTarget` | Provider-specific target identifier (only for `External`) |
+
+**Target specificity rule:** Either specify a complete GVR, or omit `target` and use `verbs: ["*"]`. Partial targets are not allowed.
+
+The `target` uses `resource` (plural, lowercase) because it describes admission on API resources:
+
+| Field | Description |
+|-------|-------------|
+| `apiGroup` | API group (e.g., `apps`, `crossplane.io`) |
+| `apiVersion` | API version (e.g., `v1`, `v1alpha1`) |
+| `resource` | Resource name (plural, lowercase, e.g., `deployments`, `replicasets`) |
 
 ### verbs (object-level)
 
@@ -669,7 +679,7 @@ apiVersion: kausality.io/v1alpha1
 metadata:
   name: database-claim-policy
 spec:
-  target:
+  for:
     apiGroup: example.com
     apiVersion: v1alpha1
     kind: DatabaseClaim
@@ -707,7 +717,7 @@ spec:
     - target:
         apiGroup: example.com
         apiVersion: v1alpha1
-        kind: XDatabase
+        resource: xdatabases
       relation: ControllerChild
       verbs: [Update]
       mutations:
@@ -723,7 +733,7 @@ spec:
     - target:
         apiGroup: example.com
         apiVersion: v1alpha1
-        kind: XDatabase
+        resource: xdatabases
       relation: ControllerChild
       verbs: [Update]
       mutations:
@@ -735,7 +745,7 @@ apiVersion: kausality.io/v1alpha1
 metadata:
   name: xdatabase-policy
 spec:
-  target:
+  for:
     apiGroup: example.com
     apiVersion: v1alpha1
     kind: XDatabase
@@ -773,7 +783,7 @@ spec:
     - target:
         apiGroup: rds.aws.crossplane.io
         apiVersion: v1alpha1
-        kind: RDSInstance
+        resource: rdsinstances
       relation: ControllerChild
       verbs: [Update]
       mutations:
@@ -792,7 +802,7 @@ spec:
     - target:
         apiGroup: rds.aws.crossplane.io
         apiVersion: v1alpha1
-        kind: RDSInstance
+        resource: rdsinstances
       relation: ControllerChild
       verbs: [Update]
       mutations:
@@ -872,7 +882,7 @@ metadata:
   annotations:
     kausality.io/derived-from: webapp  # source RGD
 spec:
-  target:
+  for:
     apiGroup: example.com
     apiVersion: v1alpha1
     kind: WebApp
@@ -897,7 +907,7 @@ spec:
     - target:
         apiGroup: apps
         apiVersion: v1
-        kind: Deployment
+        resource: deployments
       relation: ControllerChild
       verbs: [Update]
       mutations:
@@ -906,7 +916,7 @@ spec:
     - target:
         apiGroup: ""
         apiVersion: v1
-        kind: Service
+        resource: services
       relation: ControllerChild
       verbs: [Update]
       mutations:
@@ -918,7 +928,7 @@ spec:
     - target:
         apiGroup: apps
         apiVersion: v1
-        kind: Deployment
+        resource: deployments
       relation: ControllerChild
       verbs: [Update]
       mutations:
@@ -930,7 +940,7 @@ spec:
     - target:
         apiGroup: apps
         apiVersion: v1
-        kind: Deployment
+        resource: deployments
       relation: ControllerChild
       verbs: [Update]
       mutations:
